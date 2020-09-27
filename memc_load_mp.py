@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 import os
 import gzip
 import sys
@@ -9,12 +7,9 @@ import collections
 from optparse import OptionParser
 from multiprocessing import Pool
 from datetime import datetime
-# brew install protobuf
-# protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
 import appsinstalled_pb2
-# pip install python-memcached
-import memcache
+
+from memcache_pool import MemcacheSet
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
@@ -26,25 +21,19 @@ def dot_rename(path: str) -> None:
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr: str, appsinstalled: AppsInstalled, dry_run: bool = False) -> bool:
+def insert_appsinstalled(memc_addr: str, appsinstalled: AppsInstalled, memc_clien: MemcacheSet, dry_run: bool = False) -> tuple:
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
     ua.lon = appsinstalled.lon
     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
+    if dry_run:
+        logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+    else:
+        number_processed, number_error = memc_clien.add_data(memc_addr, key, packed)
+        return number_processed, number_error
+    return 1, 0
 
 
 def parse_appsinstalled(line: str) -> AppsInstalled:
@@ -71,6 +60,7 @@ def file_handler(args: tuple) -> None:
     device_memc, fn, options_dry = args
     fd = gzip.open(fn)
     logging.info('Processing %s' % fn)
+    memc_client = MemcacheSet(5, 2, 2)
     for line in fd:
         if not line:
             continue
@@ -84,11 +74,12 @@ def file_handler(args: tuple) -> None:
             errors += 1
             logging.error("Unknow device type: %s" % appsinstalled.dev_type)
             continue
-        ok = insert_appsinstalled(memc_addr, appsinstalled, options_dry)
-        if ok:
-            processed += 1
-        else:
-            errors += 1
+        number_processed, number_error = insert_appsinstalled(memc_addr, appsinstalled, memc_client, options_dry)
+        processed += number_processed
+        errors += number_error
+    number_processed, number_error = memc_client.final_send()
+    processed += number_processed
+    errors += number_error
     if not processed:
         fd.close()
         dot_rename(fn)
